@@ -52,7 +52,7 @@
         <label for="excelUpload" class="form-label">Upload Excel File (.xlsx)</label>
         <input class="form-control" type="file" id="excelUpload" accept=".xlsx">
       </div>
-      <button class="btn btn-primary" onclick="processFiles()">Next</button>
+      <button class="btn btn-primary" id="nextButton">Next</button>
     </div>
 
     <!-- Mapping Section -->
@@ -88,38 +88,305 @@
     let placeholders = new Set();
     let fieldMapping = {};
     let availableExcelKeys = [];
+    let roleFirstFormatting = null;
+
+    // Function to escape XML special characters
+    function escapeXml(unsafe) {
+      if (typeof unsafe !== 'string') return unsafe;
+      return unsafe
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;');
+    }
+
+    // Function to normalize text (e.g., curly to straight quotes)
+    function normalizeText(text) {
+      return text.replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"');
+    }
+
+    // Function to format date to dd/mm/yyyy
+    function formatDate(date) {
+      if (!date) return '';
+      let d;
+      // Try to parse Excel serial numbers if needed
+      if (typeof date === 'number') {
+        // Excel serial date: days since 1899-12-31
+        d = new Date(Date.UTC(1899, 11, 30) + date * 86400000);
+      } else if (typeof date === 'string' && !isNaN(Date.parse(date))) {
+        d = new Date(date);
+      } else if (date instanceof Date) {
+        d = date;
+      } else {
+        return '';
+      }
+      const day = String(d.getDate()).padStart(2, '0');
+      const month = String(d.getMonth() + 1).padStart(2, '0');
+      const year = d.getFullYear();
+      return `${day}/${month}/${year}`;
+    }
+
+    // Helper: Is key a date field?
+    function isDateKey(key) {
+      return ['date', 'start_date', 'end_date'].includes(key.toLowerCase());
+    }
+
+    // Function to parse XML and extract placeholders, handling formatting
+    function extractPlaceholdersFromXml(xmlContent) {
+      const parser = new DOMParser();
+      const xmlDoc = parser.parseFromString(xmlContent, 'application/xml');
+      const runs = xmlDoc.getElementsByTagName('w:r');
+      const foundPlaceholders = new Set();
+
+      let currentPlaceholder = '';
+      let collecting = false;
+      let roleFormattingCaptured = false;
+
+      for (let i = 0; i < runs.length; i++) {
+        const run = runs[i];
+        const textNode = run.getElementsByTagName('w:t')[0];
+        if (!textNode) continue;
+        let text = normalizeText(textNode.textContent);
+
+        if (collecting) {
+          currentPlaceholder += text;
+          if (text.match(/\]__|\]|>/)) {
+            const matches = currentPlaceholder.match(/(__\s*\[|\[|<)([a-zA-Z0-9_']+)(?:\]\s*__|\]|>)/g) || [];
+            matches.forEach(m => {
+              const key = m.replace(/(__\s*\[|\[|<)/, '').replace(/(?:\]\s*__|\]|>)/, '').trim();
+              if (/^[a-zA-Z0-9_']+$/.test(key)) {
+                foundPlaceholders.add(key);
+                if (key === 'Role' && !roleFormattingCaptured) {
+                  roleFirstFormatting = run.cloneNode(true);
+                  roleFormattingCaptured = true;
+                }
+              }
+            });
+            collecting = false;
+            currentPlaceholder = '';
+          }
+        } else if (text.match(/(__\s*\[|\[|<)/)) {
+          collecting = true;
+          currentPlaceholder = text;
+        } else {
+          const matches = text.match(/(__\s*\[|\[|<)([a-zA-Z0-9_']+)(?:\]\s*__|\]|>)/g) || [];
+          matches.forEach(m => {
+            const key = m.replace(/(__\s*\[|\[|<)/, '').replace(/(?:\]\s*__|\]|>)/, '').trim();
+            if (/^[a-zA-Z0-9_']+$/.test(key)) {
+              foundPlaceholders.add(key);
+              if (key === 'Role' && !roleFormattingCaptured) {
+                roleFirstFormatting = run.cloneNode(true);
+                roleFormattingCaptured = true;
+              }
+            }
+          });
+        }
+      }
+      return foundPlaceholders;
+    }
+
+    // Function to replace placeholders while preserving formatting (date fields always dd/mm/yyyy)
+    async function replacePlaceholders(zipData, dataRow) {
+      const filesToProcess = [
+        'word/document.xml',
+        'word/header1.xml', 'word/header2.xml', 'word/footer1.xml', 'word/footer2.xml',
+        'word/comments.xml', 'word/endnotes.xml', 'word/footnotes.xml'
+      ];
+      const rels = await zipData.file('word/_rels/document.xml.rels')?.async('string');
+      if (rels) {
+        const relsMatches = [...rels.matchAll(/Target="([^"]+\.xml)"/g)];
+        filesToProcess.push(...relsMatches.map(m => `word/${m[1]}`));
+      }
+
+      for (const file of filesToProcess) {
+        let xmlContent = await zipData.file(file)?.async('string');
+        if (!xmlContent) continue;
+
+        const parser = new DOMParser();
+        let xmlDoc = parser.parseFromString(xmlContent, 'application/xml');
+        // Use a static array for safe DOM mutations
+        const runs = Array.from(xmlDoc.getElementsByTagName('w:r'));
+
+        for (let i = 0; i < runs.length; i++) {
+          const run = runs[i];
+          const textNode = run.getElementsByTagName('w:t')[0];
+          if (!textNode) continue;
+          let text = normalizeText(textNode.textContent);
+
+          // Handle placeholders possibly spanning runs
+          if (text.match(/(__\s*\[|\[|<)/)) {
+            let currentPlaceholder = text;
+            let startRun = run;
+            let startIdx = i;
+            let collecting = true;
+            let matchedKey = null;
+            let endIdx = i;
+            while (collecting && endIdx < runs.length) {
+              const nextRun = runs[endIdx];
+              const nextTextNode = nextRun.getElementsByTagName('w:t')[0];
+              if (!nextTextNode) {
+                endIdx++;
+                continue;
+              }
+              if (endIdx !== i) currentPlaceholder += normalizeText(nextTextNode.textContent);
+              const match = currentPlaceholder.match(/(__\s*\[|\[|<)([a-zA-Z0-9_']+)(?:\]\s*__|\]|>)/);
+              if (match) {
+                matchedKey = match[2].trim();
+                collecting = false;
+              } else if (currentPlaceholder.match(/\]__|\]|>/)) {
+                collecting = false;
+              }
+              endIdx++;
+            }
+            if (matchedKey) {
+              let value;
+              if (fieldMapping[matchedKey]) {
+                if (isDateKey(matchedKey)) {
+                  const excelValue = dataRow[fieldMapping[matchedKey]];
+                  value = formatDate(fieldMapping[matchedKey] === 'CURRENT_DATE' ? new Date() : excelValue);
+                } else if (fieldMapping[matchedKey] === 'CURRENT_DATE') {
+                  value = formatDate(new Date());
+                } else {
+                  value = escapeXml(dataRow[fieldMapping[matchedKey]]?.toString() || '');
+                }
+              } else {
+                value = '';
+              }
+              const templateRun = matchedKey === 'Role' && roleFirstFormatting ? roleFirstFormatting : startRun;
+              const newTextNode = xmlDoc.createElement('w:t');
+              newTextNode.setAttribute('xml:space', 'preserve');
+              newTextNode.textContent = value;
+              const newRun = templateRun.cloneNode(true);
+              const oldTextNode = newRun.getElementsByTagName('w:t')[0];
+              if (oldTextNode) {
+                newRun.replaceChild(newTextNode, oldTextNode);
+              } else {
+                newRun.appendChild(newTextNode);
+              }
+              // Replace the first run, remove the others
+              startRun.parentNode.replaceChild(newRun, startRun);
+              for (let k = startIdx + 1; k < endIdx; k++) {
+                const runToRemove = runs[k];
+                if (runToRemove && runToRemove.parentNode) {
+                  runToRemove.parentNode.removeChild(runToRemove);
+                }
+              }
+              // If we removed runs, skip ahead
+              i = endIdx - 1;
+            }
+          } else {
+            // Handle multiple placeholders in one run
+            const matches = text.match(/(__\s*\[|\[|<)([a-zA-Z0-9_']+)(?:\]\s*__|\]|>)/g) || [];
+            if (matches.length > 0) {
+              let newText = text;
+              let hasRole = false;
+              matches.forEach(m => {
+                const key = m.replace(/(__\s*\[|\[|<)/, '').replace(/(?:\]\s*__|\]|>)/, '').trim();
+                let value;
+                if (fieldMapping[key]) {
+                  if (isDateKey(key)) {
+                    const excelValue = dataRow[fieldMapping[key]];
+                    value = formatDate(fieldMapping[key] === 'CURRENT_DATE' ? new Date() : excelValue);
+                  } else if (fieldMapping[key] === 'CURRENT_DATE') {
+                    value = formatDate(new Date());
+                  } else {
+                    value = escapeXml(dataRow[fieldMapping[key]]?.toString() || '');
+                  }
+                } else {
+                  value = '';
+                }
+                newText = newText.replace(m, value);
+                if (key === 'Role') hasRole = true;
+              });
+              if (newText !== text) {
+                const templateRun = hasRole && roleFirstFormatting ? roleFirstFormatting : run;
+                const newRun = templateRun.cloneNode(true);
+                const newTextNode = xmlDoc.createElement('w:t');
+                newTextNode.setAttribute('xml:space', 'preserve');
+                newTextNode.textContent = newText;
+                const oldTextNode = newRun.getElementsByTagName('w:t')[0];
+                if (oldTextNode) {
+                  newRun.replaceChild(newTextNode, oldTextNode);
+                } else {
+                  newRun.appendChild(newTextNode);
+                }
+                run.parentNode.replaceChild(newRun, run);
+              }
+            }
+          }
+        }
+        zipData.file(file, new XMLSerializer().serializeToString(xmlDoc));
+      }
+    }
 
     async function processFiles() {
       const templateInput = document.getElementById('templateUpload');
       const excelInput = document.getElementById('excelUpload');
+
       if (!templateInput.files.length || !excelInput.files.length) {
-        alert("Please upload both template and Excel file.");
+        alert("Please upload both a template (.docx) and an Excel file (.xlsx).");
         return;
       }
+      if (!templateInput.files[0] || !excelInput.files[0]) {
+        alert("Invalid file selection. Please ensure valid files are selected.");
+        return;
+      }
+
       templateDocx = templateInput.files[0];
 
-      // Use JSZip to read the .docx file and extract word/document.xml
-      const zip = new JSZip();
-      const zipData = await zip.loadAsync(templateDocx);
-      const documentXml = await zipData.file("word/document.xml").async("string");
+      try {
+        const zip = new JSZip();
+        const zipData = await zip.loadAsync(templateDocx);
 
-      // Extract placeholders from the document.xml content
-      const matches = [...documentXml.matchAll(/[\[<]([a-zA-Z0-9_]+)[\]>]/g)];
-      placeholders = new Set(matches.map(m => m[1]));
+        const filesToCheck = [
+          'word/document.xml',
+          'word/header1.xml', 'word/header2.xml', 'word/footer1.xml', 'word/footer2.xml',
+          'word/comments.xml', 'word/endnotes.xml', 'word/footnotes.xml'
+        ];
+        const rels = await zipData.file('word/_rels/document.xml.rels')?.async('string');
+        if (rels) {
+          const relsMatches = [...rels.matchAll(/Target="([^"]+\.xml)"/g)];
+          filesToCheck.push(...relsMatches.map(m => `word/${m[1]}`));
+        }
 
-      // Log the detected placeholders
-      console.log("Detected placeholders from template:", Array.from(placeholders));
+        for (const file of filesToCheck) {
+          const xmlContent = await zipData.file(file)?.async('string');
+          if (xmlContent) {
+            const found = extractPlaceholdersFromXml(xmlContent);
+            found.forEach(p => placeholders.add(p));
+          }
+        }
 
-      const fileReader = new FileReader();
-      fileReader.onload = function(e) {
-        const workbook = XLSX.read(e.target.result, { type: 'binary' });
-        const sheetName = workbook.SheetNames[0];
-        const worksheet = workbook.Sheets[sheetName];
-        excelData = XLSX.utils.sheet_to_json(worksheet);
-        availableExcelKeys = Object.keys(excelData[0]);
-        showMappingUI();
-      };
-      fileReader.readAsBinaryString(excelInput.files[0]);
+        if (placeholders.size === 0) {
+          alert("No placeholders found in the template. Please use [key], <key>, or __ [key] __ format.");
+          return;
+        }
+
+        const fileReader = new FileReader();
+        fileReader.onload = function(e) {
+          try {
+            const workbook = XLSX.read(e.target.result, { type: 'binary' });
+            const sheetName = workbook.SheetNames[0];
+            const worksheet = workbook.Sheets[sheetName];
+            excelData = XLSX.utils.sheet_to_json(worksheet);
+            if (excelData.length === 0) {
+              alert("Excel file is empty. Please upload a valid Excel file with data.");
+              return;
+            }
+            availableExcelKeys = Object.keys(excelData[0]);
+            showMappingUI();
+          } catch (err) {
+            alert("Error reading Excel file: " + err.message);
+          }
+        };
+        fileReader.onerror = function() {
+          alert("Failed to read Excel file. Please ensure it is a valid .xlsx file.");
+        };
+        fileReader.readAsBinaryString(excelInput.files[0]);
+      } catch (err) {
+        alert("Error processing template file: " + err.message);
+      }
     }
 
     function showMappingUI() {
@@ -133,14 +400,16 @@
         const wrapper = document.createElement('div');
         wrapper.className = 'mapping-container';
 
-        // Exact match for automatic mapping
         let autoMap = availableExcelKeys.find(k => k.toLowerCase() === key.toLowerCase());
-
         if (autoMap && !mappedKeys.has(autoMap)) {
           mappedKeys.add(autoMap);
         } else {
           autoMap = '';
         }
+
+        const options = isDateKey(key)
+          ? `<option value="CURRENT_DATE">Current Date</option>`
+          : '';
 
         wrapper.innerHTML = `
           <div>
@@ -151,6 +420,7 @@
             <label>Destination Column (Excel)</label>
             <select class="form-select" id="map-${key}">
               <option value="">-- Select Excel Field --</option>
+              ${options}
               ${availableExcelKeys.map(col => {
                 const disabled = mappedKeys.has(col) && col !== autoMap ? 'disabled' : '';
                 return `<option value="${col}" ${col === autoMap ? 'selected' : ''} ${disabled}>${col}</option>`;
@@ -175,25 +445,20 @@
       }
 
       document.getElementById('previewSection').style.display = 'block';
-      const zip = new JSZip();
-      const zipData = await zip.loadAsync(templateDocx);
-      let documentXml = await zipData.file("word/document.xml").async("string");
+      try {
+        const zip = new JSZip();
+        const zipData = await zip.loadAsync(templateDocx);
 
-      // Replace placeholders in the document.xml content
-      for (const key in fieldMapping) {
-        const value = excelData[0][fieldMapping[key]] || '';
-        documentXml = documentXml.replaceAll(`[${key}]`, value).replaceAll(`<${key}>`, value);
+        await replacePlaceholders(zipData, excelData[0]);
+
+        const blob = await zipData.generateAsync({ type: 'blob' });
+        const link = document.getElementById('previewDownloadLink');
+        link.href = URL.createObjectURL(blob);
+        link.download = "Preview_Document.docx";
+        link.style.display = 'inline-block';
+      } catch (err) {
+        alert("Error generating preview: " + err.message);
       }
-
-      // Update the document.xml in the zip
-      zipData.file("word/document.xml", documentXml);
-
-      // Generate the new .docx file
-      const blob = await zipData.generateAsync({ type: 'blob' });
-      const link = document.getElementById('previewDownloadLink');
-      link.href = URL.createObjectURL(blob);
-      link.download = "Preview_Document.docx";
-      link.style.display = 'inline-block';
     }
 
     async function generateDocuments() {
@@ -212,40 +477,40 @@
       document.getElementById('progressSection').style.display = 'block';
       const zip = new JSZip();
 
-      // Load the original template ZIP
-      const templateZip = new JSZip();
-      const templateZipData = await templateZip.loadAsync(templateDocx);
-      const originalDocumentXml = await templateZipData.file("word/document.xml").async("string");
+      try {
+        for (let i = 0; i < excelData.length; i++) {
+          const docZip = new JSZip();
+          const docZipData = await docZip.loadAsync(templateDocx);
 
-      for (let i = 0; i < excelData.length; i++) {
-        // Create a fresh copy of the template ZIP for each document
-        const docZip = new JSZip();
-        const docZipData = await docZip.loadAsync(templateDocx);
-        let documentXml = originalDocumentXml; // Start with the original document.xml content
+          await replacePlaceholders(docZipData, excelData[i]);
 
-        // Replace placeholders with the current row's data
-        for (const key in fieldMapping) {
-          const value = excelData[i][fieldMapping[key]] || '';
-          documentXml = documentXml.replaceAll(`[${key}]`, value).replaceAll(`<${key}>`, value);
+          const docBlob = await docZipData.generateAsync({ type: 'blob' });
+          zip.file(`Document_${i + 1}.docx`, docBlob);
+
+          const progress = ((i + 1) / excelData.length) * 100;
+          document.getElementById('progressBar').style.width = progress + '%';
+          document.getElementById('progressBar').textContent = Math.round(progress) + '%';
         }
 
-        // Update the document.xml in the new ZIP
-        docZipData.file("word/document.xml", documentXml);
-        const docBlob = await docZipData.generateAsync({ type: 'blob' });
-        zip.file(`Document_${i + 1}.docx`, docBlob);
-
-        const progress = ((i + 1) / excelData.length) * 100;
-        document.getElementById('progressBar').style.width = progress + '%';
-        document.getElementById('progressBar').textContent = Math.round(progress) + '%';
+        zip.generateAsync({ type: 'blob' }).then(function(content) {
+          const link = document.getElementById('downloadLink');
+          link.href = URL.createObjectURL(content);
+          link.download = "Documents.zip";
+          link.style.display = 'inline-block';
+        }).catch(err => {
+          alert("Error generating ZIP: " + err.message);
+        });
+      } catch (err) {
+        alert("Error generating documents: " + err.message);
       }
-
-      zip.generateAsync({ type: 'blob' }).then(function(content) {
-        const link = document.getElementById('downloadLink');
-        link.href = URL.createObjectURL(content);
-        link.download = "Documents.zip";
-        link.style.display = 'inline-block';
-      });
     }
+
+    document.addEventListener('DOMContentLoaded', function() {
+      const nextButton = document.getElementById('nextButton');
+      if (nextButton) {
+        nextButton.addEventListener('click', processFiles);
+      }
+    });
   </script>
 </body>
 </html>
